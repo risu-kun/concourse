@@ -20,14 +20,21 @@ import javax.management.MBeanRegistrationException;
 import javax.management.MalformedObjectNameException;
 import javax.management.NotCompliantMBeanException;
 
+import org.apache.thrift.TException;
 import org.apache.thrift.transport.TTransportException;
 import org.junit.Assert;
 import org.junit.Test;
 
+import com.cinchapi.concourse.Link;
 import com.cinchapi.concourse.server.ConcourseServer;
 import com.cinchapi.concourse.server.GlobalState;
 import com.cinchapi.concourse.test.ConcourseBaseTest;
+import com.cinchapi.concourse.thrift.AccessToken;
+import com.cinchapi.concourse.util.ByteBuffers;
+import com.cinchapi.concourse.util.Convert;
 import com.cinchapi.concourse.util.Environments;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 
 /**
  * Unit tests for {@link ConcourseServer}.
@@ -82,6 +89,32 @@ public class ConcourseServerTest extends ConcourseBaseTest {
     public void testFindEnvKeepsUnderScore() {
         String env = "$_%&test_@envir==--onment*_*";
         Assert.assertEquals("_test_environment_", Environments.sanitize(env));
+    }
+    
+    @Test
+    public void testLinkWalking() throws TException {
+        
+        final ConcourseServer server = ConcourseServer.create();
+        new Thread(new Runnable(){
+
+            @Override
+            public void run() {
+                try {
+                    server.start();
+                } catch (TTransportException e) {
+                    // TODO Auto-generated catch block
+                    e.printStackTrace();
+                }
+                
+            }
+            
+        }).start();
+        AccessToken creds = server.login(ByteBuffers.fromString("admin"), ByteBuffers.fromString("admin"), "default");
+        server.addKeyValueRecord("friends", Convert.javaToThrift(Link.to(1)), 2, creds, null, "default");
+        server.addKeyValueRecord("name", Convert.javaToThrift("Jeff"), 1, creds, null, "default");
+        server.addKeyValueRecord("name", Convert.javaToThrift("Robert"), 3, creds, null, "default");
+        server.addKeyValueRecord("friends", Convert.javaToThrift(Link.to(3)), 1, creds, null, "default");
+        System.out.println(server.navigateKeyRecords("friends.friends.name", Sets.<Long>newHashSet(2L), creds, null, "default"));
     }
 
 }
