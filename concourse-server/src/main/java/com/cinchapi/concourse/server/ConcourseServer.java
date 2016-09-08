@@ -1436,6 +1436,11 @@ public class ConcourseServer implements ConcourseService.Iface, ConcourseServerM
         accessManager.disableUser(ByteBuffer.wrap(username));
     }
 
+    @Override
+    public void disableUser(byte[] username) {
+        accessManager.disableUser(ByteBuffer.wrap(username));
+    }
+
     @ManagedOperation
     @Override
     @Deprecated
@@ -2533,6 +2538,12 @@ public class ConcourseServer implements ConcourseService.Iface, ConcourseServerM
     @Override
     public String listAllUserSessions() {
         return TCollections.toOrderedListString(accessManager.describeAllAccessTokens());
+    }
+
+    @Override
+    @ManagedOperation
+    public String listPluginBundles() {
+        return TCollections.toOrderedListString(plugins.listBundles());
     }
 
     @Override
