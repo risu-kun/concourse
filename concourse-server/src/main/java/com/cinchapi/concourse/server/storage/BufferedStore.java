@@ -26,6 +26,7 @@ import com.cinchapi.concourse.server.storage.temp.Write;
 import com.cinchapi.concourse.thrift.Operator;
 import com.cinchapi.concourse.thrift.TObject;
 import com.cinchapi.concourse.time.Time;
+import com.cinchapi.concourse.util.TSets;
 import com.google.common.collect.Sets;
 
 /**
@@ -143,8 +144,19 @@ public abstract class BufferedStore extends BaseStore {
     }
 
     @Override
+    public Map<Long, Set<TObject>> chronologize(String key, long record,
+            long start, long end) {
+        return chronologize(key, record, start, end, false);
+    }
+
+    @Override
     public boolean contains(long record) {
         return destination.contains(record) || buffer.contains(record);
+    }
+
+    @Override
+    public Set<Long> getAllRecords() {
+        return TSets.union(destination.getAllRecords(), buffer.getAllRecords());
     }
 
     /**
@@ -382,6 +394,36 @@ public abstract class BufferedStore extends BaseStore {
         return buffer.browse(key, Time.now(), context);
     }
 
+    /**
+     * Execute the {@code chronologize} function for {@code key} in
+     * {@code record} between {@code start} and {@code end} with the option to
+     * perform an {@code unsafe} read.
+     * 
+     * @param key the field name
+     * @param record the record id
+     * @param start the start timestamp
+     * @param end the end timestamp
+     * @param unsafe a flag that indicates whether to use the
+     *            {@link AtomicSupport#chronologizeUnsafe(String, long, long, long)
+     *            unsafe chronologize} read in the {@link #destination}; this
+     *            should be {@code true} doing an atomic operation
+     * @return a possibly empty Map from each revision timestamp to the Set of
+     *         objects that were contained in the field at the time of the
+     *         revision
+     */
+    protected Map<Long, Set<TObject>> chronologize(String key, long record,
+            long start, long end, boolean unsafe) {
+        Map<Long, Set<TObject>> context;
+        if(unsafe && destination instanceof AtomicSupport) {
+            context = ((AtomicSupport) (destination)).chronologizeUnsafe(key,
+                    record, start, end);
+        }
+        else {
+            context = destination.chronologize(key, record, start, end);
+        }
+        return buffer.chronologize(key, record, start, end, context);
+    }
+
     @Override
     protected Map<Long, Set<TObject>> doExplore(long timestamp, String key,
             Operator operator, TObject... values) {
@@ -587,5 +629,4 @@ public abstract class BufferedStore extends BaseStore {
             }
         }
     }
-
 }

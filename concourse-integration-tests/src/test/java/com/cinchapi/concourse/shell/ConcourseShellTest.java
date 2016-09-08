@@ -15,8 +15,10 @@
  */
 package com.cinchapi.concourse.shell;
 
+import java.util.Map;
+import java.util.Set;
+
 import org.junit.Assert;
-import org.junit.Ignore;
 import org.junit.Test;
 
 import com.cinchapi.concourse.shell.ConcourseShell;
@@ -155,18 +157,23 @@ public class ConcourseShellTest extends ConcourseIntegrationTest {
     }
 
     @Test
-    @Ignore
     public void testBasicUnderscoreMethodNoArgs()
             throws IrregularEvaluationResult {
-        // TODO: this does not work because it gets interpreted as a property
-        // and the logic to try to convert it from underscore case to camel case
-        // in ConcourseShell#evaluate does not run
         cash.evaluate("get_server_version");
         Assert.assertTrue(true); // test passes if it does not throw an
                                  // exception
     }
+    
+    @Test
+    public void testKeyWithUnderscore() throws IrregularEvaluationResult {
+        cash.evaluate("add 'fav_language','Go', 1");
+        Map<Object, Set<Long>> map = client.browse("fav_language");
+        Assert.assertTrue(map.containsKey("Go")); // test passes if it does
+                                                  // not throw an
+                                                  // exception
+    }
 
-    @Test(expected = EvaluationException.class)
+   @Test(expected = EvaluationException.class)
     public void testNestedApiMethodWithoutParensDoesNotInfiniteLoop()
             throws IrregularEvaluationResult {
         //NOTE: EvaluationException is valid exit state until GH-139 is fixed.

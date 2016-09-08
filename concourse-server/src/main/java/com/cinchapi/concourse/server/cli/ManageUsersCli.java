@@ -1,12 +1,12 @@
 /*
  * Copyright (c) 2013-2016 Cinchapi Inc.
- *
+ * 
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -128,6 +128,34 @@ public class ManageUsersCli extends ManagedOperationCli {
                     System.out.println("Consider it done.");
                 }
             }
+            else if(!Strings.isNullOrEmpty(opts.enableUsername)) {
+                if(!bean.hasUser(opts.enableUsername.getBytes())) {
+                    System.out
+                            .println(opts.enableUsername + " does not exist.");
+                }
+                else if(opts.username.equals(opts.enableUsername)) {
+                    System.out.println(opts.enableUsername
+                            + " is the current user.");
+                }
+                else {
+                    bean.enableUser(opts.enableUsername.getBytes());
+                    System.out.println("Consider it done.");
+                }
+            }
+            else if(!Strings.isNullOrEmpty(opts.disableUsername)) {
+                if(!bean.hasUser(opts.disableUsername.getBytes())) {
+                    System.out.println(opts.disableUsername
+                            + " does not exist.");
+                }
+                else if(opts.username.equals(opts.disableUsername)) {
+                    System.out.println(opts.disableUsername
+                            + " is the current user, so it can't be disabled.");
+                }
+                else {
+                    bean.disableUser(opts.disableUsername.getBytes());
+                    System.out.println("Consider it done.");
+                }
+            }
             else {
                 parser.usage();
             }
@@ -143,8 +171,10 @@ public class ManageUsersCli extends ManagedOperationCli {
         return super.isReadyToRun()
                 && (opts.grant || opts.revoke || opts.listSessions
                         || !Strings.isNullOrEmpty(opts.addingUsername)
-                        || !Strings.isNullOrEmpty(opts.deletingUsername) || !Strings
-                            .isNullOrEmpty(opts.editingUsername));
+                        || !Strings.isNullOrEmpty(opts.deletingUsername)
+                        || !Strings.isNullOrEmpty(opts.editingUsername)
+                        || !Strings.isNullOrEmpty(opts.enableUsername) || !Strings
+                            .isNullOrEmpty(opts.disableUsername));
     }
 
     /**
@@ -168,6 +198,12 @@ public class ManageUsersCli extends ManagedOperationCli {
 
         @Parameter(names = { "-d", "--delete-user" }, description = "Username of existing user to delete.")
         public String deletingUsername;
+
+        @Parameter(names = { "--enable-user" }, description = "Enable the user with this username.")
+        public String enableUsername;
+
+        @Parameter(names = { "--disable-user" }, description = "Disable the user with this username.")
+        public String disableUsername;
 
         @Parameter(names = { "-np", "--new-password" }, description = "Password of new user to add/edit.")
         public String newPassword;

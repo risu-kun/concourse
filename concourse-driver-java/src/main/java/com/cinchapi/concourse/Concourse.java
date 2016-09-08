@@ -39,6 +39,7 @@ import com.cinchapi.concourse.lang.Criteria;
 import com.cinchapi.concourse.lang.Language;
 import com.cinchapi.concourse.security.ClientSecurity;
 import com.cinchapi.concourse.thrift.AccessToken;
+import com.cinchapi.concourse.thrift.ComplexTObject;
 import com.cinchapi.concourse.thrift.ConcourseService;
 import com.cinchapi.concourse.thrift.Diff;
 import com.cinchapi.concourse.thrift.Operator;
@@ -2023,6 +2024,28 @@ public abstract class Concourse implements AutoCloseable {
     public abstract Set<Long> inventory();
 
     /**
+     * Invoke {@code method} using {@code args} within the plugin identified by
+     * {@code id}.
+     * 
+     * <p>
+     * There must be a class named {@code id} available in Concourse Server via
+     * a plugin distribution. The {@code method} must also be accessible within
+     * the class.
+     * </p>
+     * <p>
+     * If the plugin throws any {@link Exception}, it'll be re-thrown here as a
+     * {@link RuntimeException}.
+     * </p>
+     * 
+     * @param id the fully qualified name of the plugin class (e.g.
+     *            com.cinchapi.plugin.PluginClass)
+     * @param method the name of the method within the {@code pluginClass}
+     * @param args the arguments to pass to the {@code method}
+     * @return the result returned from the plugin
+     */
+    public abstract <T> T invokePlugin(String id, String method, Object... args);
+
+    /**
      * Atomically dump the data in each of the {@code records} as a JSON array
      * of objects.
      * 
@@ -2155,25 +2178,25 @@ public abstract class Concourse implements AutoCloseable {
      * {@code destinations}.
      * 
      * @param key the field name
-     * @param source the id of the record where each of the links originate
      * @param destinations a collection of ids for the records where each of the
      *            links points, respectively
+     * @param source the id of the record where each of the links originate
      * @return a {@link Map} associating the ids for each of the
      *         {@code destinations} to a boolean that indicates whether the link
      *         was successfully added
      */
-    public abstract Map<Long, Boolean> link(String key, long source,
-            Collection<Long> destinations);
+    public abstract Map<Long, Boolean> link(String key,
+            Collection<Long> destinations, long source);
 
     /**
      * Append a link from {@code key} in {@code source} to {@code destination}.
      * 
      * @param key the field name
-     * @param source the id of the record where the link originates
      * @param destination the id of the record where the link points
+     * @param source the id of the record where the link originates
      * @return {@code true} if the link is added
      */
-    public abstract boolean link(String key, long source, long destination);
+    public abstract boolean link(String key, long destination, long source);
 
     /**
      * Atomically check to see if each of the {@code records} currently contains
@@ -3027,11 +3050,11 @@ public abstract class Concourse implements AutoCloseable {
      * {@code destination}.
      * 
      * @param key the field name
-     * @param source the id of the record where the link originates
      * @param destination the id of the record where the link points
+     * @param source the id of the record where the link originates
      * @return {@code true} if the link is removed
      */
-    public abstract boolean unlink(String key, long source, long destination);
+    public abstract boolean unlink(String key, long destination, long source);
 
     /**
      * Return {@code true} if {@code value} is stored for {@code key} in
@@ -4940,6 +4963,26 @@ public abstract class Concourse implements AutoCloseable {
         }
 
         @Override
+        public <T> T invokePlugin(final String id, final String method,
+                final Object... args) {
+            return execute(new Callable<T>() {
+
+                @Override
+                public T call() throws Exception {
+                    List<ComplexTObject> params = Lists
+                            .newArrayListWithCapacity(args.length);
+                    for (Object arg : args) {
+                        params.add(ComplexTObject.fromJavaObject(arg));
+                    }
+                    ComplexTObject result = client.invokePlugin(id, method,
+                            params, creds, transaction, environment);
+                    return result.getJavaObject();
+                }
+
+            });
+        }
+
+        @Override
         public String jsonify(Collection<Long> records) {
             return jsonify(records, true);
         }
@@ -5010,18 +5053,18 @@ public abstract class Concourse implements AutoCloseable {
         }
 
         @Override
-        public Map<Long, Boolean> link(String key, long source,
-                Collection<Long> destinations) {
+        public Map<Long, Boolean> link(String key,
+                Collection<Long> destinations, long source) {
             Map<Long, Boolean> result = PrettyLinkedHashMap
                     .newPrettyLinkedHashMap("Record", "Result");
             for (long destination : destinations) {
-                result.put(destination, link(key, source, destination));
+                result.put(destination, link(key, destination, source));
             }
             return result;
         }
 
         @Override
-        public boolean link(String key, long source, long destination) {
+        public boolean link(String key, long destination, long source) {
             return add(key, Link.to(destination), source);
         }
 
@@ -6064,7 +6107,7 @@ public abstract class Concourse implements AutoCloseable {
         }
 
         @Override
-        public boolean unlink(String key, long source, long destination) {
+        public boolean unlink(String key, long destination, long source) {
             return remove(key, Link.to(destination), source);
         }
 

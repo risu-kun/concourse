@@ -25,6 +25,7 @@ import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -34,12 +35,9 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import javax.annotation.concurrent.ThreadSafe;
 
-import jsr166e.ConcurrentHashMapV8;
-
 import com.cinchapi.concourse.annotate.Authorized;
 import com.cinchapi.concourse.annotate.DoNotInvoke;
 import com.cinchapi.concourse.annotate.Restricted;
-import com.cinchapi.concourse.plugin.Storage;
 import com.cinchapi.concourse.server.GlobalState;
 import com.cinchapi.concourse.server.concurrent.LockService;
 import com.cinchapi.concourse.server.concurrent.PriorityReadWriteLock;
@@ -86,7 +84,6 @@ import static com.google.common.base.Preconditions.*;
 public final class Engine extends BufferedStore implements
         TransactionSupport,
         AtomicSupport,
-        Storage,
         InventoryTracker {
 
     //
@@ -261,7 +258,7 @@ public final class Engine extends BufferedStore implements
      * A collection of listeners that should be notified of a version change for
      * a given token.
      */
-    private final ConcurrentMap<Token, WeakHashMap<VersionChangeListener, Boolean>> versionChangeListeners = new ConcurrentHashMapV8<Token, WeakHashMap<VersionChangeListener, Boolean>>();
+    private final ConcurrentMap<Token, WeakHashMap<VersionChangeListener, Boolean>> versionChangeListeners = new ConcurrentHashMap<Token, WeakHashMap<VersionChangeListener, Boolean>>();
 
     /**
      * Construct an Engine that is made up of a {@link Buffer} and
@@ -317,6 +314,7 @@ public final class Engine extends BufferedStore implements
                 + File.separator + "meta" + File.separator + "inventory");
         buffer.setInventory(inventory);
         buffer.setThreadNamePrefix(environment + "-buffer");
+        buffer.setEnvironment(environment);
     }
 
     @Override
@@ -367,6 +365,11 @@ public final class Engine extends BufferedStore implements
         else {
             Logger.debug("'{}' was accepted by the Engine", write);
         }
+    }
+
+    @Override
+    public Set<Long> getAllRecords() {
+        return inventory.getAll();
     }
 
     @Override
@@ -478,15 +481,6 @@ public final class Engine extends BufferedStore implements
         }
     }
 
-    /**
-     * Public interface for the {@link browse()} method.
-     * 
-     * @return Set of records
-     */
-    public Set<Long> browse() {
-        return inventory.getAll();
-    }
-
     @Override
     public Map<TObject, Set<Long>> browse(String key) {
         transportLock.readLock().lock();
@@ -530,6 +524,33 @@ public final class Engine extends BufferedStore implements
         transportLock.readLock().lock();
         try {
             return super.browse(key);
+        }
+        finally {
+            transportLock.readLock().unlock();
+        }
+    }
+
+    @Override
+    public Map<Long, Set<TObject>> chronologize(String key, long record,
+            long start, long end) {
+        transportLock.readLock().lock();
+        Lock read = lockService.getReadLock(record);
+        read.lock();
+        try {
+            return super.chronologize(key, record, start, end);
+        }
+        finally {
+            read.unlock();
+            transportLock.readLock().unlock();
+        }
+    }
+
+    @Override
+    public Map<Long, Set<TObject>> chronologizeUnsafe(String key, long record,
+            long start, long end) {
+        transportLock.readLock().lock();
+        try {
+            return super.chronologize(key, record, start, end);
         }
         finally {
             transportLock.readLock().unlock();
@@ -586,7 +607,7 @@ public final class Engine extends BufferedStore implements
         }
         return sb.toString();
     }
-    
+
     @Override
     public Inventory getInventory() {
         return inventory;

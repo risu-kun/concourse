@@ -177,8 +177,6 @@ public final class Database extends BaseStore implements PermanentStore {
         return null;
     }
 
-    private static final String threadNamePrefix = "database-write-thread";
-
     /*
      * BLOCK DIRECTORIES
      * -----------------
@@ -191,8 +189,10 @@ public final class Database extends BaseStore implements PermanentStore {
      * another is by the directory in which they are stored.
      */
     private static final String PRIMARY_BLOCK_DIRECTORY = "cpb";
+
     private static final String SEARCH_BLOCK_DIRECTORY = "ctb";
     private static final String SECONDARY_BLOCK_DIRECTORY = "csb";
+    private static final String threadNamePrefix = "database-write-thread";
 
     /**
      * A flag to indicate if the Database has verified the data it is seeing is
@@ -220,7 +220,7 @@ public final class Database extends BaseStore implements PermanentStore {
     private final transient List<PrimaryBlock> cpb = Lists.newArrayList();
     private final transient List<SecondaryBlock> csb = Lists.newArrayList();
     private final transient List<SearchBlock> ctb = Lists.newArrayList();
-
+    
     /*
      * CURRENT BLOCK POINTERS
      * ----------------------
@@ -230,7 +230,7 @@ public final class Database extends BaseStore implements PermanentStore {
     private transient PrimaryBlock cpb0;
     private transient SecondaryBlock csb0;
     private transient SearchBlock ctb0;
-
+    
     /*
      * RECORD CACHES
      * -------------
@@ -338,6 +338,16 @@ public final class Database extends BaseStore implements PermanentStore {
                 getSecondaryRecord(Text.wrapCached(key)).browse(timestamp),
                 Functions.VALUE_TO_TOBJECT, Functions.PRIMARY_KEY_TO_LONG,
                 TObjectSorter.INSTANCE);
+    }
+
+    @Override
+    public Map<Long, Set<TObject>> chronologize(String key, long record,
+            long start, long end) {
+        return Transformers.transformMapSet(
+                getPrimaryRecord(PrimaryKey.wrap(record)).chronologize(
+                        Text.wrapCached(key), start, end),
+                com.google.common.base.Functions.<Long> identity(),
+                Functions.VALUE_TO_TOBJECT);
     }
 
     @Override

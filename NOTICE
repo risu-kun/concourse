@@ -319,6 +319,22 @@
       https://github.com/fusesource/jansi
       Copyright 2009-2011 Fusesource
 
+      SparseBitSet
+      ------------
+      SparseBitSet is an implementation of a concept presented by Dr. Bruce K
+      Haddon to form an alternative to the native Java BitSet for efficient
+      storage of sparse and large bits.
+
+      https://github.com/brettwooldridge/SparseBitSet
+      Copyright Brett Woolridge and associated authors
+
+      Catalyst
+      --------
+      Catalyst is an I/O and serialization framework designed for use in Atomix, Copycat and related projects. It provides high-level abstractions for common storage and networking facilities.
+
+      http://atomix.io/catalyst/
+      Copyright 2015 the Atomix crew
+
   3. Includes software released under the MIT License, which is compatible with
      the Apache License, Version 2.0:
 
@@ -409,14 +425,6 @@
       https://code.google.com/p/reflections/
       Copyright 2004-2015 Sam Hocevar
 
-      JSR 166E (Public Domain)
-      ------------------------
-      Concourse contains a mirror of JSR 166e source files with Cinchapi private
-      packaging so that they may be distributed and used with Java 7.
-
-      http://gee.cs.oswego.edu/cgi-bin/viewcvs.cgi/jsr166/src/jsr166e/
-      Copyright 2015 Doug Lea and members of JCP JSR-166 Expert Group
-
       ANTLR Runtime (BSD 3-Clause License)
       ------------------------------------
       ANTLR, ANother Tool for Language Recognition, is a language tool that
@@ -495,7 +503,16 @@
 
       Bats (MIT-style License)
       ------------------------
-      Bats is a TAP-compliant testing framework for Bash. It provides a simple way to verify that the UNIX programs you write behave as expected.
+      Bats is a TAP-compliant testing framework for Bash. It provides a simple
+      way to verify that the UNIX programs you write behave as expected.
 
       https://github.com/sstephenson/bats
       Copyright 2014 Sam Stephenson
+
+      Swift IDL Parser (Apache License, Version 2.0)
+      ----------------------------------------------
+      The Swift IDL Parser is distributed with Swift, an easy-to-use annotation
+      based Java library for creating Thrift serializable types and services.
+
+      https://github.com/facebook/swift
+      Copyright (C) 2012 Facebook, Inc.

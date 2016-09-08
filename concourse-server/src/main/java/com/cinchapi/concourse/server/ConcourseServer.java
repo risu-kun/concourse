@@ -25,7 +25,6 @@ import java.lang.management.MemoryUsage;
 import java.net.ServerSocket;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
-import java.util.Comparator;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
@@ -70,14 +69,13 @@ import com.cinchapi.concourse.lang.NaturalLanguage;
 import com.cinchapi.concourse.lang.Parser;
 import com.cinchapi.concourse.lang.PostfixNotationSymbol;
 import com.cinchapi.concourse.lang.Symbol;
-import com.cinchapi.concourse.plugin.ConcourseRuntime;
-import com.cinchapi.concourse.plugin.Storage;
+import com.cinchapi.concourse.plugin.data.ResultDataset;
 import com.cinchapi.concourse.security.AccessManager;
 import com.cinchapi.concourse.server.http.HttpServer;
 import com.cinchapi.concourse.server.io.FileSystem;
 import com.cinchapi.concourse.server.jmx.ConcourseServerMXBean;
 import com.cinchapi.concourse.server.jmx.ManagedOperation;
-import com.cinchapi.concourse.server.model.TObjectSorter;
+import com.cinchapi.concourse.server.plugin.PluginManager;
 import com.cinchapi.concourse.server.storage.AtomicOperation;
 import com.cinchapi.concourse.server.storage.AtomicStateException;
 import com.cinchapi.concourse.server.storage.BufferedStore;
@@ -89,6 +87,7 @@ import com.cinchapi.concourse.server.storage.TransactionStateException;
 import com.cinchapi.concourse.server.upgrade.UpgradeTasks;
 import com.cinchapi.concourse.shell.CommandLine;
 import com.cinchapi.concourse.thrift.AccessToken;
+import com.cinchapi.concourse.thrift.ComplexTObject;
 import com.cinchapi.concourse.thrift.ConcourseService;
 import com.cinchapi.concourse.thrift.Diff;
 import com.cinchapi.concourse.thrift.DuplicateEntryException;
@@ -140,8 +139,8 @@ import static com.cinchapi.concourse.server.GlobalState.*;
  * 
  * @author Jeff Nelson
  */
-public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean {
-
+public class ConcourseServer implements ConcourseService.Iface, ConcourseServerMXBean {
+    
     /**
      * Create a new {@link ConcourseServer} instance that uses the default port
      * and storage locations or those defined in the accessible
@@ -306,32 +305,6 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
     }
 
     /**
-     * Do the work to chronologize (generate a chronology of values) for
-     * {@code key} in {@code record}. If {@code history} and {@code result} are
-     * not {@code null}, then this method will only update the chronology with
-     * the latest changes since the history/result were calculated.
-     * 
-     * @param key
-     * @param record
-     * @param result
-     * @param history
-     * @param atomic
-     */
-    private static void chronologizeAtomic(String key, long record, Map<Long, Set<TObject>> result,
-            Map<Long, String> history, AtomicOperation atomic) {
-        Map<Long, String> latest = atomic.audit(key, record);
-        if (latest.size() > history.size()) {
-            for (int i = history.size(); i < latest.size(); ++i) {
-                long timestamp = Iterables.get((Iterable<Long>) latest.keySet(), i);
-                Set<TObject> values = atomic.select(key, record, timestamp);
-                if (!values.isEmpty()) {
-                    result.put(timestamp, values);
-                }
-            }
-        }
-    }
-
-    /**
      * Remove all the values mapped from the {@code key} in {@code record} using
      * the specified {@code atomic} operation.
      * 
@@ -424,11 +397,40 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
                 stack.push(TSets.union(stack.pop(), stack.pop()));
             } else if (symbol instanceof Expression) {
                 Expression exp = (Expression) symbol;
-                stack.push(exp.getTimestampRaw() == 0
-                        ? atomic.find(exp.getKeyRaw(), exp.getOperatorRaw(), exp.getValuesRaw())
-                        : atomic.find(exp.getTimestampRaw(), exp.getKeyRaw(), exp.getOperatorRaw(),
-                                exp.getValuesRaw()));
-            } else {
+                if(exp.getKeyRaw().equals(
+                        Constants.JSON_RESERVED_IDENTIFIER_NAME)) {
+                    Set<Long> ids;
+                    if(exp.getOperatorRaw() == Operator.EQUALS) {
+                        ids = Sets.newTreeSet();
+                        for (TObject tObj : exp.getValuesRaw()) {
+                            ids.add(((Number) Convert.thriftToJava(tObj))
+                                    .longValue());
+                        }
+                        stack.push(ids);
+                    }
+                    else if(exp.getOperatorRaw() == Operator.NOT_EQUALS) {
+                        ids = atomic.getAllRecords();
+                        for (TObject tObj : exp.getValuesRaw()) {
+                            ids.remove(((Number) Convert.thriftToJava(tObj))
+                                    .longValue());
+                        }
+                        stack.push(ids);
+                    }
+                    else {
+                        throw new IllegalArgumentException(
+                                "Cannot query on record id using "
+                                        + exp.getOperatorRaw());
+                    }
+                }
+                else {
+                    stack.push(exp.getTimestampRaw() == 0 ? atomic.find(
+                            exp.getKeyRaw(), exp.getOperatorRaw(),
+                            exp.getValuesRaw()) : atomic.find(
+                            exp.getTimestampRaw(), exp.getKeyRaw(),
+                            exp.getOperatorRaw(), exp.getValuesRaw()));
+                }
+            }
+            else {
                 // If we reach here, then the conversion to postfix notation
                 // failed :-/
                 throw new IllegalStateException();
@@ -660,6 +662,12 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
     private HttpServer httpServer;
 
     /**
+     * The PluginManager seamlessly handles plugins that are running in separate
+     * JVMs.
+     */
+    private PluginManager plugins;
+
+    /**
      * The Thrift server controls the RPC protocol. Use
      * https://github.com/m1ch1/mapkeeper/wiki/Thrift-Java-Servers-Compared for
      * a reference.
@@ -765,8 +773,10 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
         checkAccess(creds, transaction);
         AtomicSupport store = getStore(transaction, environment);
         Map<Long, String> base = store.audit(key, record);
-        Map<Long, String> result = TMaps.newLinkedHashMapWithCapacity(base.size());
-        int index = Timestamps.findNearestSuccessorForTimestamp(base.keySet(), start);
+        Map<Long, String> result = TMaps.newLinkedHashMapWithCapacity(base
+                .size());
+        int index = Timestamps.findNearestSuccessorForTimestamp(base.keySet(),
+                start);
         Entry<Long, String> entry = null;
         for (int i = index; i < base.size(); ++i) {
             entry = Iterables.get(base.entrySet(), i);
@@ -820,8 +830,10 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
         checkAccess(creds, transaction);
         AtomicSupport store = getStore(transaction, environment);
         Map<Long, String> base = store.audit(record);
-        Map<Long, String> result = TMaps.newLinkedHashMapWithCapacity(base.size());
-        int index = Timestamps.findNearestSuccessorForTimestamp(base.keySet(), start);
+        Map<Long, String> result = TMaps.newLinkedHashMapWithCapacity(base
+                .size());
+        int index = Timestamps.findNearestSuccessorForTimestamp(base.keySet(),
+                start);
         Entry<Long, String> entry = null;
         for (int i = index; i < base.size(); ++i) {
             entry = Iterables.get(base.entrySet(), i);
@@ -889,7 +901,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
             TransactionToken transaction, String environment) throws TException {
         checkAccess(creds, transaction);
         AtomicSupport store = getStore(transaction, environment);
-        Map<String, Map<TObject, Set<Long>>> result = TMaps.newLinkedHashMapWithCapacity(keys.size());
+        Map<String, Map<TObject, Set<Long>>> result = TMaps
+                .newLinkedHashMapWithCapacity(keys.size());
         for (String key : keys) {
             result.put(key, store.browse(key));
         }
@@ -929,18 +942,7 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
             TransactionToken transaction, String environment) throws TException {
         checkAccess(creds, transaction);
         AtomicSupport store = getStore(transaction, environment);
-        Map<Long, String> history = Maps.newLinkedHashMap();
-        AtomicOperation atomic = null;
-        Map<Long, Set<TObject>> result = Maps.newLinkedHashMap();
-        while (atomic == null || !atomic.commit()) {
-            atomic = store.startAtomicOperation();
-            try {
-                chronologizeAtomic(key, record, result, history, atomic);
-            } catch (AtomicStateException e) {
-                atomic = null;
-            }
-        }
-        return result;
+        return store.chronologize(key, record, 0, Time.now());
     }
 
     @Override
@@ -949,45 +951,46 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
     @ThrowsThriftExceptions
     public Map<Long, Set<TObject>> chronologizeKeyRecordStart(String key, long record, long start, AccessToken creds,
             TransactionToken transaction, String environment) throws TException {
-        return chronologizeKeyRecordStartEnd(key, record, start, Time.NONE, creds, transaction, environment);
+        checkAccess(creds, transaction);
+        AtomicSupport store = getStore(transaction, environment);
+        return store.chronologize(key, record, start, Time.NONE);
     }
 
     @Override
     @AutoRetry
     @ThrowsThriftExceptions
-    public Map<Long, Set<TObject>> chronologizeKeyRecordStartEnd(String key, long record, long start, long end,
-            AccessToken creds, TransactionToken transaction, String environment) throws TException {
-        // TODO review this implementation
-        Map<Long, Set<TObject>> base = chronologizeKeyRecord(key, record, creds, transaction, environment);
-        Map<Long, Set<TObject>> result = TMaps.newLinkedHashMapWithCapacity(base.size());
-        int index = Timestamps.findNearestSuccessorForTimestamp(base.keySet(), start);
-        Entry<Long, Set<TObject>> entry = null;
-        for (int i = index; i < base.size(); ++i) {
-            entry = Iterables.get(base.entrySet(), i);
-            if (entry.getKey() >= end) {
-                break;
-            }
-            result.put(entry.getKey(), entry.getValue());
-        }
-        return result;
+    public Map<Long, Set<TObject>> chronologizeKeyRecordStartEnd(String key,
+            long record, long start, long end, AccessToken creds,
+            TransactionToken transaction, String environment) throws TException {
+        checkAccess(creds, transaction);
+        AtomicSupport store = getStore(transaction, environment);
+        return store.chronologize(key, record, start, end);
     }
 
     @Override
     @Alias
     @ThrowsThriftExceptions
-    public Map<Long, Set<TObject>> chronologizeKeyRecordStartstr(String key, long record, String start,
-            AccessToken creds, TransactionToken transaction, String environment) throws TException {
-        return chronologizeKeyRecordStart(key, record, NaturalLanguage.parseMicros(start), creds, transaction,
-                environment);
+    public Map<Long, Set<TObject>> chronologizeKeyRecordStartstr(String key,
+            long record, String start, AccessToken creds,
+            TransactionToken transaction, String environment) throws TException {
+        checkAccess(creds, transaction);
+        AtomicSupport store = getStore(transaction, environment);
+        return store.chronologize(key, record,
+                NaturalLanguage.parseMicros(start), Time.now());
     }
 
     @Override
     @Alias
     @ThrowsThriftExceptions
-    public Map<Long, Set<TObject>> chronologizeKeyRecordStartstrEndstr(String key, long record, String start,
-            String end, AccessToken creds, TransactionToken transaction, String environment) throws TException {
-        return chronologizeKeyRecordStartEnd(key, record, NaturalLanguage.parseMicros(start),
-                NaturalLanguage.parseMicros(end), creds, transaction, environment);
+    public Map<Long, Set<TObject>> chronologizeKeyRecordStartstrEndstr(
+            String key, long record, String start, String end,
+            AccessToken creds, TransactionToken transaction, String environment)
+            throws TException {
+        checkAccess(creds, transaction);
+        AtomicSupport store = getStore(transaction, environment);
+        return store.chronologize(key, record,
+                NaturalLanguage.parseMicros(start),
+                NaturalLanguage.parseMicros(end));
     }
 
     @Override
@@ -1164,7 +1167,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
             TransactionToken transaction, String environment) throws TException {
         checkAccess(creds, transaction);
         AtomicSupport store = getStore(transaction, environment);
-        Map<Long, Set<String>> result = TMaps.newLinkedHashMapWithCapacity(records.size());
+        Map<Long, Set<String>> result = TMaps
+                .newLinkedHashMapWithCapacity(records.size());
         for (long record : records) {
             result.put(record, store.describe(record, timestamp));
         }
@@ -1427,6 +1431,11 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
                 transaction, environment);
     }
 
+    @Override
+    public void disableUser(byte[] username) {
+        accessManager.disableUser(ByteBuffer.wrap(username));
+    }
+
     @ManagedOperation
     @Override
     @Deprecated
@@ -1437,6 +1446,11 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
     @Override
     public String dump(String id, String env) {
         return getEngine(env).dump(id);
+    }
+
+    @Override
+    public void enableUser(byte[] username) {
+        accessManager.enableUser(ByteBuffer.wrap(username));
     }
 
     @Override
@@ -1648,7 +1662,9 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
                     findAtomic(queue, stack, atomic);
                     Set<Long> records = stack.pop();
                     for (long record : records) {
-                        Map<String, TObject> entry = TMaps.newLinkedHashMapWithCapacity(atomic.describe(record).size());
+                        Map<String, TObject> entry = TMaps
+                                .newLinkedHashMapWithCapacity(atomic.describe(
+                                        record).size());
                         for (String key : atomic.describe(record)) {
                             try {
                                 entry.put(key, Iterables.getLast(atomic.select(key, record)));
@@ -1689,7 +1705,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
                     Set<Long> records = stack.pop();
                     for (long record : records) {
                         Map<String, TObject> entry = TMaps
-                                .newLinkedHashMapWithCapacity(atomic.describe(record, timestamp).size());
+                                .newLinkedHashMapWithCapacity(atomic.describe(
+                                        record, timestamp).size());
                         for (String key : atomic.describe(record, timestamp)) {
                             try {
                                 entry.put(key, Iterables.getLast(atomic.select(key, record, timestamp)));
@@ -1736,7 +1753,9 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
                 findAtomic(queue, stack, atomic);
                 Set<Long> records = stack.pop();
                 for (long record : records) {
-                    Map<String, TObject> entry = TMaps.newLinkedHashMapWithCapacity(atomic.describe(record).size());
+                    Map<String, TObject> entry = TMaps
+                            .newLinkedHashMapWithCapacity(atomic.describe(
+                                    record).size());
                     for (String key : atomic.describe(record)) {
                         try {
                             entry.put(key, Iterables.getLast(atomic.select(key, record)));
@@ -1773,7 +1792,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
                 Set<Long> records = stack.pop();
                 for (long record : records) {
                     Map<String, TObject> entry = TMaps
-                            .newLinkedHashMapWithCapacity(atomic.describe(record, timestamp).size());
+                            .newLinkedHashMapWithCapacity(atomic.describe(
+                                    record, timestamp).size());
                     for (String key : atomic.describe(record, timestamp)) {
                         try {
                             entry.put(key, Iterables.getLast(atomic.select(key, record)));
@@ -2000,7 +2020,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
     public Map<Long, TObject> getKeyRecordsTime(String key, List<Long> records, long timestamp, AccessToken creds,
             TransactionToken transaction, String environment) throws TException {
         checkAccess(creds, transaction);
-        Map<Long, TObject> result = TMaps.newLinkedHashMapWithCapacity(records.size());
+        Map<Long, TObject> result = TMaps.newLinkedHashMapWithCapacity(records
+                .size());
         AtomicSupport store = getStore(transaction, environment);
         for (long record : records) {
             try {
@@ -2054,7 +2075,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
                     findAtomic(queue, stack, atomic);
                     Set<Long> records = stack.pop();
                     for (long record : records) {
-                        Map<String, TObject> entry = TMaps.newLinkedHashMapWithCapacity(keys.size());
+                        Map<String, TObject> entry = TMaps
+                                .newLinkedHashMapWithCapacity(keys.size());
                         for (String key : keys) {
                             try {
                                 entry.put(key, Iterables.getLast(atomic.select(key, record)));
@@ -2094,7 +2116,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
                     findAtomic(queue, stack, atomic);
                     Set<Long> records = stack.pop();
                     for (long record : records) {
-                        Map<String, TObject> entry = TMaps.newLinkedHashMapWithCapacity(keys.size());
+                        Map<String, TObject> entry = TMaps
+                                .newLinkedHashMapWithCapacity(keys.size());
                         for (String key : keys) {
                             try {
                                 entry.put(key, Iterables.getLast(atomic.select(key, record, timestamp)));
@@ -2141,7 +2164,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
                 findAtomic(queue, stack, atomic);
                 Set<Long> records = stack.pop();
                 for (long record : records) {
-                    Map<String, TObject> entry = TMaps.newLinkedHashMapWithCapacity(keys.size());
+                    Map<String, TObject> entry = TMaps
+                            .newLinkedHashMapWithCapacity(keys.size());
                     for (String key : keys) {
                         try {
                             entry.put(key, Iterables.getLast(atomic.select(key, record)));
@@ -2177,7 +2201,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
                 findAtomic(queue, stack, atomic);
                 Set<Long> records = stack.pop();
                 for (long record : records) {
-                    Map<String, TObject> entry = TMaps.newLinkedHashMapWithCapacity(keys.size());
+                    Map<String, TObject> entry = TMaps
+                            .newLinkedHashMapWithCapacity(keys.size());
                     for (String key : keys) {
                         try {
                             entry.put(key, Iterables.getLast(atomic.select(key, record, timestamp)));
@@ -2247,7 +2272,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
             atomic = store.startAtomicOperation();
             try {
                 for (long record : records) {
-                    Map<String, TObject> entry = TMaps.newLinkedHashMapWithCapacity(keys.size());
+                    Map<String, TObject> entry = TMaps
+                            .newLinkedHashMapWithCapacity(keys.size());
                     for (String key : keys) {
                         try {
                             entry.put(key, Iterables.getLast(atomic.select(key, record)));
@@ -2273,10 +2299,12 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
     public Map<Long, Map<String, TObject>> getKeysRecordsTime(List<String> keys, List<Long> records, long timestamp,
             AccessToken creds, TransactionToken transaction, String environment) throws TException {
         checkAccess(creds, transaction);
-        Map<Long, Map<String, TObject>> result = TMaps.newLinkedHashMapWithCapacity(records.size());
+        Map<Long, Map<String, TObject>> result = TMaps
+                .newLinkedHashMapWithCapacity(records.size());
         AtomicSupport store = getStore(transaction, environment);
         for (long record : records) {
-            Map<String, TObject> entry = TMaps.newLinkedHashMapWithCapacity(keys.size());
+            Map<String, TObject> entry = TMaps
+                    .newLinkedHashMapWithCapacity(keys.size());
             for (String key : keys) {
                 try {
                     entry.put(key, Iterables.getLast(store.select(key, record, timestamp)));
@@ -2307,7 +2335,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
     public Map<String, TObject> getKeysRecordTime(List<String> keys, long record, long timestamp, AccessToken creds,
             TransactionToken transaction, String environment) throws TException {
         checkAccess(creds, transaction);
-        Map<String, TObject> result = TMaps.newLinkedHashMapWithCapacity(keys.size());
+        Map<String, TObject> result = TMaps.newLinkedHashMapWithCapacity(keys
+                .size());
         AtomicSupport store = getStore(transaction, environment);
         for (String key : keys) {
             try {
@@ -2339,21 +2368,6 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
     @ManagedOperation
     public String getServerVersion() {
         return Version.getVersion(ConcourseServer.class).toString();
-    }
-
-    @Override
-    public Storage getStorage() {
-        return getEngine();
-    }
-
-    @Override
-    public Storage getStorage(String environment) {
-        return getEngine(environment);
-    }
-
-    @Override
-    public Comparator<TObject> getTObjectSorter() {
-        return TObjectSorter.INSTANCE;
     }
 
     @Override
@@ -2450,10 +2464,25 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
     }
 
     @Override
+    @ManagedOperation
+    public void installPluginBundle(String file) {
+        plugins.installBundle(file);
+    }
+
+    @Override
     @ThrowsThriftExceptions
     public Set<Long> inventory(AccessToken creds, TransactionToken transaction, String environment) throws TException {
         checkAccess(creds, transaction);
-        return getEngine(environment).browse();
+        return getStore(transaction, environment).getAllRecords();
+    }
+
+    @Override
+    @ThrowsThriftExceptions
+    public ComplexTObject invokePlugin(String id, String method,
+            List<ComplexTObject> params, AccessToken creds,
+            TransactionToken transaction, String environment) throws TException {
+        return plugins.invoke(id, method, params, creds, transaction,
+                environment);
     }
 
     @Override
@@ -2504,6 +2533,12 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
     @Override
     public String listAllUserSessions() {
         return TCollections.toOrderedListString(accessManager.describeAllAccessTokens());
+    }
+
+    @Override
+    @ManagedOperation
+    public String listPluginBundles() {
+        return TCollections.toOrderedListString(plugins.listBundles());
     }
 
     @Override
@@ -2575,7 +2610,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
     @Override
     @Atomic
     @ThrowsThriftExceptions
-    public void reconcileKeyRecordValues(String key, long record, Set<TObject> values, AccessToken creds,
+    public void reconcileKeyRecordValues(String key, long record,
+            Set<TObject> values, AccessToken creds,
             TransactionToken transaction, String environment) throws TException {
         checkAccess(creds, transaction);
         AtomicSupport store = getStore(transaction, environment);
@@ -2585,14 +2621,15 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
             try {
                 Set<TObject> existingValues = store.select(key, record);
                 for (TObject existingValue : existingValues) {
-                    if (!values.remove(existingValue)) {
+                    if(!values.remove(existingValue)) {
                         atomic.remove(key, existingValue, record);
                     }
                 }
                 for (TObject value : values) {
                     atomic.add(key, value, record);
                 }
-            } catch (AtomicStateException e) {
+            }
+            catch (AtomicStateException e) {
                 atomic = null;
             }
         }
@@ -2779,7 +2816,9 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
         try {
             Queue<PostfixNotationSymbol> queue = Parser.toPostfixNotation(ccl);
             AtomicSupport store = getStore(transaction, environment);
-            Map<Long, Map<String, Set<TObject>>> result = Maps.newLinkedHashMap();
+            Map<Long, Map<String, Set<TObject>>> result = (INVOCATION_THREAD_CLASS == Thread
+                    .currentThread().getClass()) ? new ResultDataset()
+                            : Maps.newLinkedHashMap();
             AtomicOperation atomic = null;
             while (atomic == null || !atomic.commit()) {
                 atomic = store.startAtomicOperation();
@@ -2789,7 +2828,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
                     Set<Long> records = stack.pop();
                     for (long record : records) {
                         Map<String, Set<TObject>> entry = TMaps
-                                .newLinkedHashMapWithCapacity(atomic.describe(record).size());
+                                .newLinkedHashMapWithCapacity(atomic.describe(
+                                        record).size());
                         for (String key : atomic.describe(record)) {
                             entry.put(key, atomic.select(key, record));
                         }
@@ -2814,7 +2854,9 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
         try {
             Queue<PostfixNotationSymbol> queue = Parser.toPostfixNotation(ccl);
             AtomicSupport store = getStore(transaction, environment);
-            Map<Long, Map<String, Set<TObject>>> result = Maps.newLinkedHashMap();
+            Map<Long, Map<String, Set<TObject>>> result = (INVOCATION_THREAD_CLASS == Thread
+                    .currentThread().getClass()) ? new ResultDataset()
+                            : Maps.newLinkedHashMap();
             AtomicOperation atomic = null;
             while (atomic == null || !atomic.commit()) {
                 atomic = store.startAtomicOperation();
@@ -2824,7 +2866,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
                     Set<Long> records = stack.pop();
                     for (long record : records) {
                         Map<String, Set<TObject>> entry = TMaps
-                                .newLinkedHashMapWithCapacity(atomic.describe(record, timestamp).size());
+                                .newLinkedHashMapWithCapacity(atomic.describe(
+                                        record, timestamp).size());
                         for (String key : atomic.describe(record, timestamp)) {
                             entry.put(key, atomic.select(key, record, timestamp));
                         }
@@ -2856,7 +2899,9 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
         checkAccess(creds, transaction);
         Queue<PostfixNotationSymbol> queue = convertCriteriaToQueue(criteria);
         AtomicSupport store = getStore(transaction, environment);
-        Map<Long, Map<String, Set<TObject>>> result = Maps.newLinkedHashMap();
+        Map<Long, Map<String, Set<TObject>>> result = (INVOCATION_THREAD_CLASS == Thread
+                .currentThread().getClass()) ? new ResultDataset()
+                        : Maps.newLinkedHashMap();
         AtomicOperation atomic = null;
         while (atomic == null || !atomic.commit()) {
             atomic = store.startAtomicOperation();
@@ -2866,7 +2911,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
                 Set<Long> records = stack.pop();
                 for (long record : records) {
                     Map<String, Set<TObject>> entry = TMaps
-                            .newLinkedHashMapWithCapacity(atomic.describe(record).size());
+                            .newLinkedHashMapWithCapacity(atomic.describe(
+                                    record).size());
                     for (String key : atomic.describe(record)) {
                         entry.put(key, atomic.select(key, record));
                     }
@@ -2887,7 +2933,9 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
         checkAccess(creds, transaction);
         Queue<PostfixNotationSymbol> queue = convertCriteriaToQueue(criteria);
         AtomicSupport store = getStore(transaction, environment);
-        Map<Long, Map<String, Set<TObject>>> result = Maps.newLinkedHashMap();
+        Map<Long, Map<String, Set<TObject>>> result = (INVOCATION_THREAD_CLASS == Thread
+                .currentThread().getClass()) ? new ResultDataset()
+                        : Maps.newLinkedHashMap();
         AtomicOperation atomic = null;
         while (atomic == null || !atomic.commit()) {
             atomic = store.startAtomicOperation();
@@ -2897,7 +2945,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
                 Set<Long> records = stack.pop();
                 for (long record : records) {
                     Map<String, Set<TObject>> entry = TMaps
-                            .newLinkedHashMapWithCapacity(atomic.describe(record, timestamp).size());
+                            .newLinkedHashMapWithCapacity(atomic.describe(
+                                    record, timestamp).size());
                     for (String key : atomic.describe(record, timestamp)) {
                         entry.put(key, atomic.select(key, record, timestamp));
                     }
@@ -3128,7 +3177,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
             AccessToken creds, TransactionToken transaction, String environment) throws TException {
         checkAccess(creds, transaction);
         AtomicSupport store = getStore(transaction, environment);
-        Map<Long, Set<TObject>> result = TMaps.newLinkedHashMapWithCapacity(records.size());
+        Map<Long, Set<TObject>> result = TMaps
+                .newLinkedHashMapWithCapacity(records.size());
         for (long record : records) {
             result.put(record, store.select(key, record, timestamp));
         }
@@ -3170,7 +3220,9 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
         try {
             Queue<PostfixNotationSymbol> queue = Parser.toPostfixNotation(ccl);
             AtomicSupport store = getStore(transaction, environment);
-            Map<Long, Map<String, Set<TObject>>> result = Maps.newLinkedHashMap();
+            Map<Long, Map<String, Set<TObject>>> result = (INVOCATION_THREAD_CLASS == Thread
+                    .currentThread().getClass()) ? new ResultDataset()
+                            : Maps.newLinkedHashMap();
             AtomicOperation atomic = null;
             while (atomic == null || !atomic.commit()) {
                 atomic = store.startAtomicOperation();
@@ -3204,7 +3256,9 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
         try {
             Queue<PostfixNotationSymbol> queue = Parser.toPostfixNotation(ccl);
             AtomicSupport store = getStore(transaction, environment);
-            Map<Long, Map<String, Set<TObject>>> result = Maps.newLinkedHashMap();
+            Map<Long, Map<String, Set<TObject>>> result = (INVOCATION_THREAD_CLASS == Thread
+                    .currentThread().getClass()) ? new ResultDataset()
+                            : Maps.newLinkedHashMap();
             AtomicOperation atomic = null;
             while (atomic == null || !atomic.commit()) {
                 atomic = store.startAtomicOperation();
@@ -3245,7 +3299,9 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
         checkAccess(creds, transaction);
         Queue<PostfixNotationSymbol> queue = convertCriteriaToQueue(criteria);
         AtomicSupport store = getStore(transaction, environment);
-        Map<Long, Map<String, Set<TObject>>> result = Maps.newLinkedHashMap();
+        Map<Long, Map<String, Set<TObject>>> result = (INVOCATION_THREAD_CLASS == Thread
+                .currentThread().getClass()) ? new ResultDataset()
+                        : Maps.newLinkedHashMap();
         AtomicOperation atomic = null;
         while (atomic == null || !atomic.commit()) {
             atomic = store.startAtomicOperation();
@@ -3275,7 +3331,9 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
         checkAccess(creds, transaction);
         Queue<PostfixNotationSymbol> queue = convertCriteriaToQueue(criteria);
         AtomicSupport store = getStore(transaction, environment);
-        Map<Long, Map<String, Set<TObject>>> result = Maps.newLinkedHashMap();
+        Map<Long, Map<String, Set<TObject>>> result = (INVOCATION_THREAD_CLASS == Thread
+                .currentThread().getClass()) ? new ResultDataset()
+                        : Maps.newLinkedHashMap();
         AtomicOperation atomic = null;
         while (atomic == null || !atomic.commit()) {
             atomic = store.startAtomicOperation();
@@ -3338,13 +3396,16 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
             AccessToken creds, TransactionToken transaction, String environment) throws TException {
         checkAccess(creds, transaction);
         AtomicSupport store = getStore(transaction, environment);
-        Map<Long, Map<String, Set<TObject>>> result = Maps.newLinkedHashMap();
+        Map<Long, Map<String, Set<TObject>>> result = (INVOCATION_THREAD_CLASS == Thread
+                .currentThread().getClass()) ? new ResultDataset()
+                        : Maps.newLinkedHashMap();
         AtomicOperation atomic = null;
         while (atomic == null || !atomic.commit()) {
             atomic = store.startAtomicOperation();
             try {
                 for (long record : records) {
-                    Map<String, Set<TObject>> entry = TMaps.newLinkedHashMapWithCapacity(keys.size());
+                    Map<String, Set<TObject>> entry = TMaps
+                            .newLinkedHashMapWithCapacity(keys.size());
                     for (String key : keys) {
                         entry.put(key, atomic.select(key, record));
                     }
@@ -3367,9 +3428,12 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
             long timestamp, AccessToken creds, TransactionToken transaction, String environment) throws TException {
         checkAccess(creds, transaction);
         AtomicSupport store = getStore(transaction, environment);
-        Map<Long, Map<String, Set<TObject>>> result = TMaps.newLinkedHashMapWithCapacity(records.size());
+        Map<Long, Map<String, Set<TObject>>> result = (INVOCATION_THREAD_CLASS == Thread
+                .currentThread().getClass()) ? new ResultDataset()
+                        : TMaps.newLinkedHashMapWithCapacity(records.size());
         for (long record : records) {
-            Map<String, Set<TObject>> entry = TMaps.newLinkedHashMapWithCapacity(keys.size());
+            Map<String, Set<TObject>> entry = TMaps
+                    .newLinkedHashMapWithCapacity(keys.size());
             for (String key : keys) {
                 entry.put(key, store.select(key, record, timestamp));
             }
@@ -3397,7 +3461,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
             AccessToken creds, TransactionToken transaction, String environment) throws TException {
         checkAccess(creds, transaction);
         AtomicSupport store = getStore(transaction, environment);
-        Map<String, Set<TObject>> result = TMaps.newLinkedHashMapWithCapacity(keys.size());
+        Map<String, Set<TObject>> result = TMaps
+                .newLinkedHashMapWithCapacity(keys.size());
         for (String key : keys) {
             result.put(key, store.select(key, record, timestamp));
         }
@@ -3429,7 +3494,9 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
             TransactionToken transaction, String environment) throws TException {
         checkAccess(creds, transaction);
         AtomicSupport store = getStore(transaction, environment);
-        Map<Long, Map<String, Set<TObject>>> result = Maps.newLinkedHashMap();
+        Map<Long, Map<String, Set<TObject>>> result = (INVOCATION_THREAD_CLASS == Thread
+                .currentThread().getClass()) ? new ResultDataset()
+                        : Maps.newLinkedHashMap();
         AtomicOperation atomic = null;
         while (atomic == null || !atomic.commit()) {
             atomic = store.startAtomicOperation();
@@ -3452,7 +3519,9 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
             TransactionToken transaction, String environment) throws TException {
         checkAccess(creds, transaction);
         AtomicSupport store = getStore(transaction, environment);
-        Map<Long, Map<String, Set<TObject>>> result = TMaps.newLinkedHashMapWithCapacity(records.size());
+        Map<Long, Map<String, Set<TObject>>> result = (INVOCATION_THREAD_CLASS == Thread
+                .currentThread().getClass()) ? new ResultDataset()
+                        : TMaps.newLinkedHashMapWithCapacity(records.size());
         for (long record : records) {
             result.put(record, store.select(record, timestamp));
         }
@@ -3542,6 +3611,7 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
             engine.start();
         }
         httpServer.start();
+        plugins.start();
         System.out.println("The Concourse server has started");
         server.serve();
     }
@@ -3552,6 +3622,7 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
     public void stop() {
         if (server.isServing()) {
             server.stop();
+            plugins.stop();
             httpServer.stop();
             for (Engine engine : engines.values()) {
                 engine.stop();
@@ -3575,6 +3646,12 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
         } catch (Exception e) {
             throw new ParseException(e.getMessage());
         }
+    }
+
+    @Override
+    @ManagedOperation
+    public void uninstallPluginBundle(String name) {
+        plugins.uninstallBundle(name);
     }
 
     @Atomic
@@ -3758,6 +3835,8 @@ public class ConcourseServer implements ConcourseRuntime, ConcourseServerMXBean 
         this.httpServer = GlobalState.HTTP_PORT > 0 ? HttpServer.create(this, GlobalState.HTTP_PORT)
                 : HttpServer.disabled();
         getEngine(); // load the default engine
+        this.plugins = new PluginManager(GlobalState.CONCOURSE_HOME
+                + File.separator + "plugins");
     }
 
     /**
